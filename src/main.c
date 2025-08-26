@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 #include "config.h"
 #include "flow_sensor.h"
@@ -12,7 +13,45 @@
 
 static const char *TAG = "MAIN";
 
-// Variáveis para controle do LED
+// ===================== BUZZER =====================
+void buzzer_init(void)
+{
+    // Configurar timer PWM
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_MODE,
+        .duty_resolution = LEDC_DUTY_RES,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_FREQUENCY,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // Configurar canal PWM
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode = LEDC_MODE,
+        .channel = LEDC_CHANNEL,
+        .timer_sel = LEDC_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .gpio_num = BUZZER_PIN,
+        .duty = 0, // Inicia desligado
+        .hpoint = 0
+    };
+    ledc_channel_config(&ledc_channel);
+}
+
+void buzzer_on(void)
+{
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (1 << (LEDC_DUTY_RES - 1))); // 50%
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
+void buzzer_off(void)
+{
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
+// ===================== LEDS =====================
 static uint8_t led_state = 0;
 static int64_t last_led_toggle = 0;
 
@@ -24,36 +63,47 @@ void get_gps_position(char *buffer, size_t len) {
 void update_led(float flow_Lday) {
     int64_t now = esp_timer_get_time();
     
-if (flow_Lday >= 5000) {
-        // Verde (desliga vermelho e azul, liga verde)
+    if (flow_Lday >= 5000) {
+        // Verde
         gpio_set_level(LED_RED_GPIO, 0);
         gpio_set_level(LED_GREEN_GPIO, 1);
         gpio_set_level(LED_BLUE_GPIO, 0);
+        buzzer_off();
     } 
     else if (flow_Lday >= 3000) {
-        // Azul (desliga vermelho e verde, liga azul)
+        // Azul
         gpio_set_level(LED_RED_GPIO, 0);
         gpio_set_level(LED_GREEN_GPIO, 0);
         gpio_set_level(LED_BLUE_GPIO, 1);
+        buzzer_off();
     } 
     else if (flow_Lday >= 1000) {
-        // Vermelho
+        // Vermelho fixo
         gpio_set_level(LED_RED_GPIO, 1);
         gpio_set_level(LED_GREEN_GPIO, 0);
         gpio_set_level(LED_BLUE_GPIO, 0);
+        buzzer_off();
     } 
     else {
-        // Piscar vermelho (500ms intervalo)
+        // Piscar vermelho (500 ms) + buzzer junto
         if (now - last_led_toggle > 500000) {
             led_state = !led_state;
             gpio_set_level(LED_RED_GPIO, led_state);
             gpio_set_level(LED_GREEN_GPIO, 0);
             gpio_set_level(LED_BLUE_GPIO, 0);
+
+            if (led_state) {
+                buzzer_on();
+            } else {
+                buzzer_off();
+            }
+
             last_led_toggle = now;
         }
     }
 }
 
+// ===================== MAIN =====================
 void app_main(void) {
     // serial
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -61,8 +111,9 @@ void app_main(void) {
 
     storage_init();
     flow_sensor_init();
+    buzzer_init();   // <-- inicializa o buzzer
 
-    // configure reset button (active LOW)
+    // Botão de reset
     gpio_config_t btn_conf = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
@@ -72,7 +123,7 @@ void app_main(void) {
     };
     gpio_config(&btn_conf);
 
-    // Configurar os pinos do LED como saídas
+    // LEDs
     gpio_config_t led_conf = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
@@ -88,13 +139,12 @@ void app_main(void) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000)); // 1s loop
 
-        // check reset button (active low)
+        // Botão reset
         if (gpio_get_level(RESET_BUTTON_GPIO) == 0) {
             storage_reset_hidrometer();
             totalLiters = 0.0f;
             ESP_LOGW(TAG, "Botão pressionado -> Reset do hidrômetro");
-            // simple debounce
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(500)); // debounce
         }
 
         int64_t now = esp_timer_get_time();
@@ -106,13 +156,12 @@ void app_main(void) {
         totalLiters += increment;
         storage_save_hidrometer(totalLiters);
 
-        float flow_Lmin = (increment / interval) * 60.0f; // L/min
-        float flow_Lday = flow_Lmin * 60.0f * 24.0f;     // L/day
+        float flow_Lmin = (increment / interval) * 60.0f;
+        float flow_Lday = flow_Lmin * 60.0f * 24.0f;
 
-        // Atualizar LED baseado na vazão
         update_led(flow_Lday);
 
-        // local time (may be epoch 1970 until RTC/NTP configured)
+        // Local time
         time_t t = time(NULL);
         struct tm tm;
         localtime_r(&t, &tm);
